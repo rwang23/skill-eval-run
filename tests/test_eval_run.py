@@ -107,6 +107,33 @@ class EvalRunTests(unittest.TestCase):
         self.assertEqual(fact["workspace_created"], ["out.txt"])
         self.assertTrue(fact["answer"].startswith("done: "))
 
+    def test_timeout_kills_the_whole_process_tree(self) -> None:
+        marker = self.root / "grandchild.pid"
+        child = ("import subprocess,sys,time,pathlib;"
+                 f"p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)']);"
+                 f"pathlib.Path(r'{marker}').write_text(str(p.pid)); time.sleep(120)")
+        run.ADAPTERS["sleepy"] = {"argv": [sys.executable, "-c", child], "prompt": "argument"}
+        try:
+            self.plan("sleepy:model-z")
+            run.main(["prepare", str(self.run_dir)])
+            self.assertEqual(run.main(["execute", str(self.run_dir), "--yes", "--timeout", "5", "--executor", "sleepy-model-z"]), 0)
+        finally:
+            del run.ADAPTERS["sleepy"]
+        log = [json.loads(line) for line in (self.run_dir / "execution.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(all(entry["exit"] == "timeout" for entry in log))
+        pid = int(marker.read_text())
+        import subprocess as sp
+        if sys.platform == "win32":
+            alive = str(pid) in sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True).stdout
+        else:
+            import os
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        self.assertFalse(alive, "the grandchild must not survive a timeout")
+
     def test_claude_transcript_attach_facts_packet_and_collect(self) -> None:
         self.plan("host:claude-sonnet", "host:gpt-terra")
         run.main(["prepare", str(self.run_dir)])

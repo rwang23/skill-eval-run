@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "target_revision": "a8000a6e698e6e86b614ea446bed60a525e474f179c1acd330c0d950a15cb35b",
-  "package_revision": "93d00cbb592fa70721d080595799b501ced62493cc17ff2a1830b9a1acd3e3bb",
+  "package_revision": "06040d9e9bd88a8710895d29b2d5a039ff12ce5b89641ca41dc7c17d3b64fcbd",
   "runs": [
     {
       "kind": "fixture",
@@ -10,7 +10,7 @@
       "judge": null,
       "blind": false,
       "isolated": false,
-      "observed_at": "2026-11-01T07:47:37Z",
+      "observed_at": "2026-11-01T07:51:14Z",
       "cases": [
         {
           "id": "held-out-same-model-judge",

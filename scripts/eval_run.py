@@ -161,6 +161,27 @@ def _resolve(program: str) -> str:
     return found
 
 
+def _new_group() -> dict[str, Any]:
+    """Start the executor in its own process group so a timeout can stop everything it spawned."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """CLI shims start the real agent as a grandchild; killing only the shim leaves it running."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    else:
+        import signal
+
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.wait(timeout=30)
+
+
 def _fill(argv: list[str], **values: str) -> list[str]:
     """Substitute only known placeholders, so literal braces in a command survive."""
     pattern = re.compile(r"\{(" + "|".join(map(re.escape, values)) + r")\}")
@@ -181,11 +202,14 @@ def _execute_one(run_dir: Path, executor: dict[str, str], case_id: str, timeout:
     argv[0] = _resolve(argv[0])
     started = _now()
     with (traces / f"{case_id}.trace").open("wb") as out, (traces / f"{case_id}.err").open("wb") as err:
+        proc = subprocess.Popen(argv, cwd=workspace, stdout=out, stderr=err,
+                                stdin=subprocess.PIPE if spec["prompt"] == "stdin" else subprocess.DEVNULL,
+                                **_new_group())
         try:
-            stdin_args = {"input": prompt.encode("utf-8")} if spec["prompt"] == "stdin" else {"stdin": subprocess.DEVNULL}
-            proc = subprocess.run(argv, cwd=workspace, stdout=out, stderr=err, timeout=timeout, check=False, **stdin_args)
+            proc.communicate(input=prompt.encode("utf-8") if spec["prompt"] == "stdin" else None, timeout=timeout)
             code = proc.returncode
         except subprocess.TimeoutExpired:
+            _kill_tree(proc)
             code = "timeout"
     return {"executor": executor["name"], "case": case_id, "exit": code, "started_at": started, "finished_at": _now()}
 
