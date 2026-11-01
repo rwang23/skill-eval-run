@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,21 +29,30 @@ _spec = importlib.util.spec_from_file_location("eval_results", Path(__file__).wi
 eval_results = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(eval_results)
 
+# Claude Code blocks reads outside the workspace; grant read-only access to the Skills and rules under test.
+CLAUDE_READ_RULES = ["Read(~/.codex/skills/**)", "Read(~/.codex/references/**)", "Read(~/.codex/docs/**)",
+                     "Read(~/.codex/AGENTS.md)", "Read(~/.claude/skills/**)"]
+CLAUDE_NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+
 # Headless adapters. {prompt_file} is always written; prompt delivery is per adapter.
+# `isolation` is appended unless a case sets "mcp": true; it keeps executors away from connected live accounts.
 ADAPTERS: dict[str, dict[str, Any]] = {
     "codex": {
         "argv": ["codex", "exec", "-m", "{model}", "-s", "workspace-write", "-C", "{workspace}",
-                 "--skip-git-repo-check", "--json", "-o", "{answer}", "-"],
+                 "--skip-git-repo-check", "--json", "-o", "{answer}"],
         "prompt": "stdin",
         "judge_argv": ["codex", "exec", "-m", "{model}", "-s", "read-only", "-C", "{workspace}",
-                       "--skip-git-repo-check", "--json", "-o", "{answer}", "-"],
+                       "--skip-git-repo-check", "--json", "-o", "{answer}"],
+        "isolation": "codex",
+        "tail": ["-"],
     },
     "claude": {
         "argv": ["claude", "-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
-                 "--permission-mode", "acceptEdits"],
+                 "--permission-mode", "acceptEdits", "--allowedTools", *CLAUDE_READ_RULES],
         "prompt": "stdin",
         "judge_argv": ["claude", "-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
                        "--permission-mode", "default"],
+        "isolation": CLAUDE_NO_MCP,
     },
     "opencode": {
         "argv": ["opencode", "run", "--format", "json", "--dir", "{workspace}", "-m", "{model}", "{prompt_line}"],
@@ -55,6 +65,50 @@ ADAPTERS: dict[str, dict[str, Any]] = {
 }
 HOST = "host"  # executed by the calling agent (for example Claude Code subagents); register with `attach`
 SKIP_DIRS = {".git", "node_modules", "__pycache__"}
+
+# Executors get an allowlisted environment: an agent can print its environment, so credentials kept in
+# environment variables must never reach it. `plan --pass-env NAME` adds a variable an adapter needs.
+SAFE_ENV = {
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "OS", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "ALLUSERSPROFILE",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432", "PUBLIC", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS", "PSMODULEPATH", "LANG", "LANGUAGE", "TERM", "SHELL", "USER", "LOGNAME", "TZ",
+    "PYTHONIOENCODING", "PYTHONUTF8", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_GIT_BASH_PATH",
+}
+SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASS|CRED|AUTH|COOKIE|SESSION", re.I)
+# Text that means the executor's sandbox failed, not the Skill; such runs are rerun, not judged.
+ENVIRONMENT_ERRORS = ("CreateProcessAsUserW failed",)
+INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+
+
+def executor_env(pass_env: list[str] | None = None) -> dict[str, str]:
+    extra = {name.upper() for name in pass_env or []}
+    env = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper in extra or (upper in SAFE_ENV and not SECRET_NAME.search(upper)) or upper.startswith("LC_"):
+            env[name] = value
+    return env
+
+
+def isolation_args(adapter: str) -> list[str]:
+    """Arguments that cut an executor off from account connectors and MCP servers."""
+    spec = ADAPTERS[adapter].get("isolation")
+    if spec != "codex":
+        return list(spec or [])
+    args = ["--disable", "apps"]  # ChatGPT account connectors (`codex_apps`)
+    config = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+    if config.is_file():
+        try:
+            import tomllib
+
+            servers = tomllib.loads(config.read_text(encoding="utf-8")).get("mcp_servers", {})
+        except (ImportError, ValueError):
+            servers = {}
+        for name in servers:
+            args += ["-c", f"mcp_servers.{name}.enabled=false"]
+    return args
 
 
 def _now() -> str:
@@ -122,6 +176,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "executors": executors,
         "cases": [c["id"] for c in cases],
         "runs": len(cases) * len(executors),
+        "pass_env": sorted(set(args.pass_env or [])),
     }
     _save(run_dir / "run.json", plan)
     print(f"plan={run_dir / 'run.json'} cases={len(cases)} executors={len(executors)} runs={plan['runs']}")
@@ -129,16 +184,43 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _workspace_root(run_dir: Path, skill: Path, requested: str | None) -> Path:
+    """Workspaces live away from the run directory and the Skill, so an executor cannot browse run controls,
+    other executors' work, or the eval suite from its parent folders."""
+    root = Path(requested or tempfile.gettempdir()).resolve()
+    for forbidden in (run_dir, skill):
+        if root == forbidden or forbidden in root.parents:
+            raise ValueError(f"workspace root must not be inside {forbidden}")
+    for folder in (root, *root.parents):
+        for name in INSTRUCTION_FILES:
+            if (folder / name).is_file():
+                raise ValueError(f"{folder / name} would be loaded by executors; choose another --workspace-root")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _workspace(run_dir: Path, executor: str, case_id: str) -> Path:
+    mapping = run_dir / "workspaces.json"
+    if mapping.is_file():
+        return Path(_load(mapping)[f"{executor}/{case_id}"])
+    return run_dir / "workspaces" / executor / case_id  # runs prepared before workspaces moved out
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     run_dir = Path(args.run).resolve()
     plan = _load(run_dir / "run.json")
     skill = Path(plan["skill_dir"])
     suite = {c["id"]: c for c in _load(skill / "evals" / "evals.json").get("evals", [])}
+    if (run_dir / "workspaces.json").exists():
+        raise ValueError("this run is already prepared")
+    root = _workspace_root(run_dir, skill, args.workspace_root)
+    mapping = {}
     for executor in plan["executors"]:
         for case_id in plan["cases"]:
             case = suite[case_id]
-            workspace = run_dir / "workspaces" / executor["name"] / case_id
-            workspace.mkdir(parents=True, exist_ok=False)
+            # One unrelated, randomly named folder per run: siblings reveal nothing about the run.
+            workspace = Path(tempfile.mkdtemp(prefix="w", dir=root))
+            mapping[f"{executor['name']}/{case_id}"] = str(workspace)
             if case.get("fixture"):
                 source = (skill / "evals" / "fixtures" / case["fixture"]).resolve()
                 if skill / "evals" / "fixtures" not in source.parents and source != skill / "evals" / "fixtures":
@@ -150,7 +232,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             prompt_file.parent.mkdir(parents=True, exist_ok=True)
             prompt_file.write_text(prompt, encoding="utf-8", newline="\n")
             _save(run_dir / "snapshots" / executor["name"] / f"{case_id}.json", _snapshot(workspace))
-    print(f"prepared={len(plan['executors']) * len(plan['cases'])} run={run_dir}")
+    _save(run_dir / "workspaces.json", mapping)
+    print(f"prepared={len(plan['executors']) * len(plan['cases'])} run={run_dir} workspaces={root}")
     return 0
 
 
@@ -188,21 +271,27 @@ def _fill(argv: list[str], **values: str) -> list[str]:
     return [pattern.sub(lambda m: values[m.group(1)], part) for part in argv]
 
 
-def _execute_one(run_dir: Path, executor: dict[str, str], case_id: str, timeout: int, judge: bool = False) -> dict[str, Any]:
+def build_argv(adapter: str, judge: bool, mcp: bool, **values: str) -> list[str]:
+    spec = ADAPTERS[adapter]
+    base = spec["judge_argv"] if judge and "judge_argv" in spec else spec["argv"]
+    return _fill([*base, *([] if mcp else isolation_args(adapter)), *spec.get("tail", [])], **values)
+
+
+def _execute_one(run_dir: Path, executor: dict[str, str], case_id: str, timeout: int, judge: bool = False,
+                 mcp: bool = False, pass_env: list[str] | None = None) -> dict[str, Any]:
     spec = ADAPTERS[executor["adapter"]]
-    workspace = run_dir if judge else run_dir / "workspaces" / executor["name"] / case_id
+    workspace = run_dir if judge else _workspace(run_dir, executor["name"], case_id)
     prompt_file = (run_dir / "judge-prompt.md") if judge else (run_dir / "prompts" / executor["name"] / f"{case_id}.txt")
     traces = run_dir / "traces" / ("judge" if judge else executor["name"])
     traces.mkdir(parents=True, exist_ok=True)
     answer = traces / f"{case_id}.answer.md"
     prompt = prompt_file.read_text(encoding="utf-8")
-    argv = _fill(spec["judge_argv"] if judge and "judge_argv" in spec else spec["argv"],
-                 model=executor["model"], workspace=str(workspace), answer=str(answer),
-                 prompt_line=" ".join(prompt.split()))
+    argv = build_argv(executor["adapter"], judge, mcp, model=executor["model"], workspace=str(workspace),
+                      answer=str(answer), prompt_line=" ".join(prompt.split()))
     argv[0] = _resolve(argv[0])
     started = _now()
     with (traces / f"{case_id}.trace").open("wb") as out, (traces / f"{case_id}.err").open("wb") as err:
-        proc = subprocess.Popen(argv, cwd=workspace, stdout=out, stderr=err,
+        proc = subprocess.Popen(argv, cwd=workspace, stdout=out, stderr=err, env=executor_env(pass_env),
                                 stdin=subprocess.PIPE if spec["prompt"] == "stdin" else subprocess.DEVNULL,
                                 **_new_group())
         try:
@@ -220,10 +309,16 @@ def cmd_execute(args: argparse.Namespace) -> int:
     if not args.yes:
         raise ValueError(f"execute starts {plan['runs']} agent runs; rerun with --yes after the user confirms")
     executors = [e for e in plan["executors"] if e["adapter"] != HOST and (not args.executor or e["name"] in args.executor)]
-    jobs = [(e, c) for e in executors for c in plan["cases"]]
+    cases = [c for c in plan["cases"] if not args.case or c in args.case]
+    suite = {c["id"]: c for c in _load(Path(plan["skill_dir"]) / "evals" / "evals.json").get("evals", [])}
+    for adapter in sorted({e["adapter"] for e in executors if not ADAPTERS[e["adapter"]].get("isolation")}):
+        print(f"warning: adapter {adapter} has no MCP/connector isolation; its runs can reach connected accounts")
+    jobs = [(e, c) for e in executors for c in cases]
     log = run_dir / "execution.jsonl"
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.max_parallel)) as pool:
-        for result in pool.map(lambda job: _execute_one(run_dir, job[0], job[1], args.timeout), jobs):
+        for result in pool.map(lambda job: _execute_one(run_dir, job[0], job[1], args.timeout,
+                                                        mcp=bool(suite.get(job[1], {}).get("mcp")),
+                                                        pass_env=plan.get("pass_env")), jobs):
             with log.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(result) + "\n")
             print(f"{result['executor']}/{result['case']} exit={result['exit']}")
@@ -262,6 +357,8 @@ def _walk_strings(value: Any):
 def trace_facts(trace: Path) -> dict[str, Any]:
     """Routing facts from Codex, Claude Code, opencode JSON events, or plain text, without message bodies."""
     skills, scripts, tool_names = set(), set(), set()
+    inputs: list[str] = []
+    commands = failed = 0
     answer = ""
     text = trace.read_text(encoding="utf-8", errors="ignore") if trace.is_file() else ""
     for line in text.splitlines():
@@ -283,9 +380,14 @@ def trace_facts(trace: Path) -> dict[str, Any]:
                 elif isinstance(block, dict) and block.get("type") == "text" and event.get("type") == "assistant":
                     answer = block.get("text", answer)
         item = event.get("item") if isinstance(event.get("item"), dict) else None
+        if item and item.get("type") == "command_execution" and event.get("type") == "item.completed":
+            commands += 1
+            failed += any(m in str(item.get("aggregated_output") or "") for m in ENVIRONMENT_ERRORS)
         if item and item.get("type") in {"command_execution", "file_change", "mcp_tool_call"}:
             tool_names.add(item["type"])
             tool_inputs.append(item)
+            # Only what the agent typed, not the output, counts as deliberately opening a path.
+            inputs.extend(_walk_strings({k: item.get(k) for k in ("command", "changes", "arguments", "path")}))
         if item and item.get("type") == "agent_message":
             answer = item.get("text", answer)
         part = event.get("part") if isinstance(event.get("part"), dict) else None
@@ -300,32 +402,76 @@ def trace_facts(trace: Path) -> dict[str, Any]:
             for string in _walk_strings(value):
                 skills.update(SKILL_MD.findall(string))
                 scripts.update(SCRIPT.findall(string))
+                if not item:  # Claude and opencode inputs hold no output
+                    inputs.append(string)
     if not tool_names:  # plain-text fallback
         skills.update(SKILL_MD.findall(text))
         scripts.update(SCRIPT.findall(text))
-    return {"skills_read_or_invoked": sorted(skills), "scripts_run": sorted(scripts), "tools": sorted(tool_names), "answer_from_trace": answer[-6000:]}
+    return {"skills_read_or_invoked": sorted(skills), "scripts_run": sorted(scripts), "tools": sorted(tool_names),
+            "answer_from_trace": answer[-6000:], "tool_inputs": inputs,
+            "sandbox_failures": {"commands": commands, "failed": failed}}
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.replace("\\\\", "/").replace("\\", "/").lower().split())
+
+
+def integrity_violations(text: str, inputs: list[str], *, case: dict[str, Any], skill_name: str, run_dir: Path | None,
+                         other_workspaces: list[Path]) -> list[str]:
+    """Signs that a run saw eval controls. Any one makes the run invalid; it is rerun, never judged."""
+    trace, typed = _norm(text), _norm("\n".join(inputs))
+    found = []
+    hidden = [case.get("expected_output", ""), *case.get("expectations", [])]
+    if any(len(t) >= 30 and _norm(t) in trace for t in hidden):
+        found.append("trace contains expected output or expectations the executor was never shown")
+    if run_dir is not None and _norm(str(run_dir)) in trace:
+        found.append("trace touches the run directory")
+    if any(_norm(str(w)) in trace for w in other_workspaces):
+        found.append("trace touches another run's workspace")
+    if f"{skill_name.lower()}/evals/" in typed:
+        found.append("a tool opened the eval suite of the Skill under test")
+    if skill_name != "skill-eval-run" and "skill-eval-run/" in typed:
+        found.append("a tool opened the eval runner")
+    return found
 
 
 def cmd_facts(args: argparse.Namespace) -> int:
     run_dir = Path(args.run).resolve()
     plan = _load(run_dir / "run.json")
+    suite = {c["id"]: c for c in _load(Path(plan["skill_dir"]) / "evals" / "evals.json").get("evals", [])}
+    workspaces = {f"{e['name']}/{c}": _workspace(run_dir, e["name"], c) for e in plan["executors"] for c in plan["cases"]}
     facts = []
     for executor in plan["executors"]:
         for case_id in plan["cases"]:
+            run_id = f"{executor['name']}/{case_id}"
             traces = run_dir / "traces" / executor["name"]
             trace = traces / f"{case_id}.trace"
             if not trace.is_file():
-                facts.append({"run_id": f"{executor['name']}/{case_id}", "status": "missing-trace"})
+                facts.append({"run_id": run_id, "status": "missing-trace"})
                 continue
             info = trace_facts(trace)
             answer_file = traces / f"{case_id}.answer.md"
             answer = answer_file.read_text(encoding="utf-8", errors="ignore") if answer_file.is_file() else info.pop("answer_from_trace")
             info.pop("answer_from_trace", None)
+            text = trace.read_text(encoding="utf-8", errors="ignore")
+            workspace = workspaces[run_id]
+            legacy = run_dir in workspace.parents  # old layout: the run directory is the workspace's parent
+            violations = integrity_violations(
+                text, info.pop("tool_inputs"), case=suite.get(case_id, {}), skill_name=plan["skill_name"],
+                run_dir=None if legacy else run_dir,
+                other_workspaces=[w for r, w in workspaces.items() if r != run_id])
+            env_errors = [m for m in ENVIRONMENT_ERRORS if m in text]
+            sandbox = info["sandbox_failures"]
+            # Agents retry around an occasional sandbox failure; only a mostly failed run says nothing about the Skill.
+            broken = sandbox["failed"] * 2 >= sandbox["commands"] if sandbox["commands"] else bool(env_errors)
+            status = "invalid" if violations else "environment-error" if env_errors and broken else "ok"
             before = _load(run_dir / "snapshots" / executor["name"] / f"{case_id}.json")
-            after = _snapshot(run_dir / "workspaces" / executor["name"] / case_id)
+            after = _snapshot(workspace)
             facts.append({
-                "run_id": f"{executor['name']}/{case_id}",
-                "status": "ok",
+                "run_id": run_id,
+                "status": status,
+                "integrity_violations": violations,
+                "environment_errors": env_errors,
                 "executor": executor["name"],
                 "model": executor["model"],
                 "case_id": case_id,
@@ -336,8 +482,14 @@ def cmd_facts(args: argparse.Namespace) -> int:
                 "answer": answer[-6000:],
             })
     _save(run_dir / "facts.json", facts)
-    missing = [f["run_id"] for f in facts if f["status"] != "ok"]
-    print(f"facts={run_dir / 'facts.json'} runs={len(facts)} missing={len(missing)}")
+    missing = [f["run_id"] for f in facts if f["status"] == "missing-trace"]
+    invalid = [f["run_id"] for f in facts if f["status"] == "invalid"]
+    env_failed = [f["run_id"] for f in facts if f["status"] == "environment-error"]
+    print(f"facts={run_dir / 'facts.json'} runs={len(facts)} missing={len(missing)} invalid={len(invalid)} environment-error={len(env_failed)}")
+    for run_id in invalid:
+        print(f"invalid {run_id}: rerun from a fresh `prepare`; it is not judged")
+    for run_id in env_failed:
+        print(f"environment-error {run_id}: rerun with `execute --case`; it is not judged")
     return 1 if missing else 0
 
 
@@ -346,7 +498,8 @@ JUDGE_PROMPT = """You are an independent judge. You did not execute any of these
 Read {packet}. Each entry is one run of one eval case by one executor: the prompt it received, the expected
 output and expectations (written before the run), the Skill under test and whether it should have triggered,
 the routing facts extracted from the trace, the files it created, modified, or deleted in its workspace, and
-its final answer. The full trace is at `trace`; open it when the facts are not enough.
+its final answer. The full trace is at `trace`; open it when the facts are not enough. `sandbox_failures`
+counts commands the executor's sandbox refused to start; do not fail a run for a step the sandbox blocked.
 
 Grade three layers separately for each entry:
 - routing: when should_trigger names the Skill under test, did the run actually use it (invoking it, reading
@@ -381,6 +534,7 @@ def cmd_packet(args: argparse.Namespace) -> int:
             "expected_output": case.get("expected_output", ""),
             "expectations": case.get("expectations", []),
             "routing_facts": {k: fact[k] for k in ("skills_read_or_invoked", "scripts_run", "tools")},
+            "sandbox_failures": fact.get("sandbox_failures"),
             "workspace_changes": {k: fact[k] for k in ("workspace_created", "workspace_modified", "workspace_deleted")},
             "answer": fact["answer"],
             "trace": str(run_dir / "traces" / fact["executor"] / f"{fact['case_id']}.trace"),
@@ -450,12 +604,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
                                         model=executor["model"], judge=judge, observed_at=_now())
                 recorded.append(executor["name"])
     _save(run_dir / "outcomes.json", outcomes)
-    _write_report(run_dir, plan, by_id, expected)
+    skipped = {f["run_id"]: f["status"] for f in _load(run_dir / "facts.json") if f.get("status") != "ok"}
+    _write_report(run_dir, plan, by_id, expected, skipped)
     print(f"outcomes={run_dir / 'outcomes.json'} recorded={','.join(recorded) or 'none'} report={run_dir / 'report.md'}")
     return 0
 
 
-def _write_report(run_dir: Path, plan: dict[str, Any], by_id: dict[str, Any], expected: list[str]) -> None:
+def _write_report(run_dir: Path, plan: dict[str, Any], by_id: dict[str, Any], expected: list[str],
+                  skipped: dict[str, str] | None = None) -> None:
+    skipped = skipped or {}
     executors = [e["name"] for e in plan["executors"]]
     lines = [f"# Eval run: {plan['skill_name']}", "", f"Revision `{plan['skill_revision'][:12]}`, package `{plan['package_revision'][:12]}`.", "",
              "| Case | " + " | ".join(executors) + " |", "|---|" + "---|" * len(executors)]
@@ -465,7 +622,7 @@ def _write_report(run_dir: Path, plan: dict[str, Any], by_id: dict[str, Any], ex
         for name in executors:
             entry = by_id.get(f"{name}/{case_id}")
             if entry is None:
-                cells.append("-")
+                cells.append(skipped.get(f"{name}/{case_id}", "-"))
                 continue
             results.append(bool(entry.get("passed")))
             cells.append("pass" if entry.get("passed") else "FAIL")
@@ -474,7 +631,8 @@ def _write_report(run_dir: Path, plan: dict[str, Any], by_id: dict[str, Any], ex
         elif results and not any(results):
             failing.append(case_id)
         lines.append(f"| {case_id} | " + " | ".join(cells) + " |")
-    lines += ["", f"Failing on every executor: {', '.join(failing) or 'none'}", f"Differs between executors: {', '.join(flaky) or 'none'}", "", "## Reasons", ""]
+    lines += ["", f"Failing on every executor: {', '.join(failing) or 'none'}", f"Differs between executors: {', '.join(flaky) or 'none'}",
+              "Not judged, rerun: " + (", ".join(f"{k} ({v})" for k, v in sorted(skipped.items())) or "none"), "", "## Reasons", ""]
     for run_id in expected:
         entry = by_id[run_id]
         lines.append(f"- `{run_id}` {'pass' if entry.get('passed') else 'FAIL'} (routing {entry.get('routing')}, compliance {entry.get('compliance')}, expectations {entry.get('expectations')}): {entry.get('reason', '')}")
@@ -490,14 +648,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"Repeatable. Adapters: {', '.join(ADAPTERS)}, or {HOST} for runs the calling agent executes itself.")
     p.add_argument("--cases", nargs="*", help="Case ids; default all.")
     p.add_argument("--types", nargs="*", help="Filter by case type, or 'pressure'.")
+    p.add_argument("--pass-env", action="append", metavar="NAME",
+                   help="Repeatable. Pass this environment variable to executors; all others outside a small allowlist are withheld.")
     p.add_argument("--out", required=True, help="Empty run directory.")
     p.set_defaults(func=cmd_plan)
     p = sub.add_parser("prepare", help="Create one isolated workspace and prompt per executor and case.")
     p.add_argument("run")
+    p.add_argument("--workspace-root", help="Where workspaces are created; default the system temp directory. Never inside the run directory.")
     p.set_defaults(func=cmd_prepare)
     p = sub.add_parser("execute", help="Run CLI executors headless. Requires --yes.")
     p.add_argument("run")
     p.add_argument("--executor", action="append", help="Limit to these executor names.")
+    p.add_argument("--case", action="append", help="Limit to these case ids, for example to rerun an environment failure.")
     p.add_argument("--max-parallel", type=int, default=3)
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--yes", action="store_true", help="The user confirmed the run count and cost.")

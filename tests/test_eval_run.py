@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -56,6 +57,7 @@ class EvalRunTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.skill = make_skill(self.root)
         self.run_dir = self.root / "run"
+        self.ws_root = self.root / "ws"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -75,17 +77,40 @@ class EvalRunTests(unittest.TestCase):
         self.assertEqual(run.main(["plan", str(self.skill), "--out", str(self.root / "r2"), "--executor", "nope:x"]), 3)
         self.assertEqual(run.main(["plan", str(self.skill), "--out", str(self.root / "r3"), "--executor", "host:x", "--cases", "ghost"]), 3)
 
+    def prepare(self) -> None:
+        self.assertEqual(run.main(["prepare", str(self.run_dir), "--workspace-root", str(self.ws_root)]), 0)
+
+    def ws(self, executor: str, case: str) -> Path:
+        return run._workspace(self.run_dir, executor, case)
+
     def test_prepare_isolates_workspaces_and_writes_blind_prompts(self) -> None:
         self.plan("host:model-a", "host:model-b")
-        self.assertEqual(run.main(["prepare", str(self.run_dir)]), 0)
+        self.prepare()
+        seen = set()
         for name in ("host-model-a", "host-model-b"):
-            workspace = self.run_dir / "workspaces" / name / "positive-a"
+            workspace = self.ws(name, "positive-a")
             self.assertEqual((workspace / "input.md").read_text(encoding="utf-8"), "hello")
+            self.assertNotIn(self.run_dir, workspace.parents, "workspaces live outside the run directory")
+            self.assertEqual(workspace.parent, self.ws_root)
+            self.assertNotIn("eval", workspace.name.lower())
+            seen.add(workspace)
             prompt = (self.run_dir / "prompts" / name / "positive-a.txt").read_text(encoding="utf-8")
             self.assertIn(str(workspace), prompt)
             self.assertNotIn("eval", prompt.lower(), "the executor is not told it is being evaluated")
+        self.assertEqual(len(seen), 2)
         held = (self.run_dir / "prompts" / "host-model-a" / "held-out-b.txt").read_text(encoding="utf-8")
-        self.assertTrue(held.endswith(f"Look in {self.run_dir / 'workspaces' / 'host-model-a' / 'held-out-b'} first."))
+        self.assertTrue(held.endswith(f"Look in {self.ws('host-model-a', 'held-out-b')} first."))
+        self.assertEqual(run.main(["prepare", str(self.run_dir), "--workspace-root", str(self.ws_root)]), 3, "prepared once")
+
+    def test_workspace_root_refuses_run_dir_skill_and_instruction_files(self) -> None:
+        self.plan("host:model-a")
+        self.assertEqual(run.main(["prepare", str(self.run_dir), "--workspace-root", str(self.run_dir / "inner")]), 3)
+        self.assertEqual(run.main(["prepare", str(self.run_dir), "--workspace-root", str(self.skill / "w")]), 3)
+        loaded = self.root / "project"
+        loaded.mkdir()
+        (loaded / "AGENTS.md").write_text("rules", encoding="utf-8")
+        self.assertEqual(run.main(["prepare", str(self.run_dir), "--workspace-root", str(loaded / "deep")]), 3)
+        self.assertFalse((self.run_dir / "workspaces.json").exists())
 
     def test_execute_needs_confirmation_and_runs_a_cli_adapter(self) -> None:
         script = ("import sys,json,pathlib; p=sys.stdin.read(); pathlib.Path('out.txt').write_text('x');"
@@ -94,7 +119,7 @@ class EvalRunTests(unittest.TestCase):
         run.ADAPTERS["fake"] = {"argv": [sys.executable, "-c", script], "prompt": "stdin"}
         try:
             self.plan("fake:model-x")
-            run.main(["prepare", str(self.run_dir)])
+            self.prepare()
             self.assertEqual(run.main(["execute", str(self.run_dir)]), 3, "refuses without --yes")
             self.assertEqual(run.main(["execute", str(self.run_dir), "--yes", "--max-parallel", "2"]), 0)
             self.assertEqual(run.main(["facts", str(self.run_dir)]), 0)
@@ -115,7 +140,7 @@ class EvalRunTests(unittest.TestCase):
         run.ADAPTERS["sleepy"] = {"argv": [sys.executable, "-c", child], "prompt": "argument"}
         try:
             self.plan("sleepy:model-z")
-            run.main(["prepare", str(self.run_dir)])
+            self.prepare()
             self.assertEqual(run.main(["execute", str(self.run_dir), "--yes", "--timeout", "5", "--executor", "sleepy-model-z"]), 0)
         finally:
             del run.ADAPTERS["sleepy"]
@@ -136,7 +161,7 @@ class EvalRunTests(unittest.TestCase):
 
     def test_claude_transcript_attach_facts_packet_and_collect(self) -> None:
         self.plan("host:claude-sonnet", "host:gpt-terra")
-        run.main(["prepare", str(self.run_dir)])
+        self.prepare()
         transcript = self.root / "t.jsonl"
         transcript.write_text("\n".join(json.dumps(x) for x in [
             {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "sample-skill"}}]}},
@@ -145,7 +170,7 @@ class EvalRunTests(unittest.TestCase):
         for executor in ("host-claude-sonnet", "host-gpt-terra"):
             for case in ("positive-a", "held-out-b"):
                 self.assertEqual(run.main(["attach", str(self.run_dir), "--executor", executor, "--case", case, "--transcript", str(transcript)]), 0)
-        (self.run_dir / "workspaces" / "host-gpt-terra" / "positive-a" / "input.md").write_text("changed", encoding="utf-8")
+        (self.ws("host-gpt-terra", "positive-a") / "input.md").write_text("changed", encoding="utf-8")
         self.assertEqual(run.main(["facts", str(self.run_dir)]), 0)
         facts = {f["run_id"]: f for f in json.loads((self.run_dir / "facts.json").read_text(encoding="utf-8"))}
         self.assertEqual(facts["host-claude-sonnet/positive-a"]["skills_read_or_invoked"], ["sample-skill"])
@@ -173,7 +198,7 @@ class EvalRunTests(unittest.TestCase):
 
     def test_collect_refuses_when_package_changed_after_plan_or_runs_missing(self) -> None:
         self.plan("host:m1")
-        run.main(["prepare", str(self.run_dir)])
+        self.prepare()
         transcript = self.root / "t.txt"
         transcript.write_text("plain text answer", encoding="utf-8")
         for case in ("positive-a", "held-out-b"):
@@ -187,6 +212,91 @@ class EvalRunTests(unittest.TestCase):
         (self.skill / "scripts" / "tool.py").write_bytes(b"print(2)\n")
         self.assertEqual(run.main(["collect", str(self.run_dir), "--judgement", str(full), "--judge", "j", "--judge-model", "m9"]), 3)
         self.assertFalse((self.skill / "evals" / "results.json").exists())
+
+
+class IsolationTests(EvalRunTests):
+    def run_fake(self, script: str, *plan_args: str) -> dict:
+        run.ADAPTERS["fake"] = {"argv": [sys.executable, "-c", script], "prompt": "stdin"}
+        try:
+            argv = ["plan", str(self.skill), "--out", str(self.run_dir), "--executor", "fake:model-x", *plan_args]
+            self.assertEqual(run.main(argv), 0)
+            self.prepare()
+            self.assertEqual(run.main(["execute", str(self.run_dir), "--yes"]), 0)
+            run.main(["facts", str(self.run_dir)])
+        finally:
+            del run.ADAPTERS["fake"]
+        return {f["run_id"]: f for f in json.loads((self.run_dir / "facts.json").read_text(encoding="utf-8"))}
+
+    def test_executor_gets_no_credentials_from_the_environment(self) -> None:
+        script = ("import os,json; print(json.dumps({'type':'item.completed','item':{'type':'agent_message',"
+                  "'text':' '.join(sorted(os.environ))}}))")
+        planted = {"FAKE_SERVICE_API_KEY": "k-123", "SHOP_DB_URL": "postgres://u:p@h/db", "PASSABLE_SETTING": "ok"}
+        os.environ.update(planted)
+        try:
+            facts = self.run_fake(script, "--pass-env", "PASSABLE_SETTING")
+        finally:
+            for name in planted:
+                os.environ.pop(name, None)
+        names = facts["fake-model-x/positive-a"]["answer"].upper().split()
+        self.assertNotIn("FAKE_SERVICE_API_KEY", names)
+        self.assertNotIn("SHOP_DB_URL", names, "unlisted variables are withheld even without a secret-like name")
+        self.assertIn("PASSABLE_SETTING", names, "--pass-env opts a variable in")
+        self.assertIn("PATH", names)
+
+    def test_runs_that_saw_eval_controls_are_invalid_and_not_judged(self) -> None:
+        suite_file = self.skill / "evals" / "evals.json"
+        suite = json.loads(suite_file.read_text(encoding="utf-8"))
+        suite["evals"][1]["expectations"] = ["Answers the held-out request from the workspace notes."]
+        suite_file.write_text(json.dumps(suite), encoding="utf-8")
+        leak = ("import json,sys; p=sys.stdin.read();"
+                "cmd='rg x C:/s/sample-skill/evals/evals.json' if 'notes' in p else 'echo Answers the held-out  request from the workspace notes.';"
+                "print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':cmd,'aggregated_output':''}}));"
+                "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))")
+        facts = self.run_fake(leak)
+        self.assertEqual(facts["fake-model-x/positive-a"]["status"], "invalid")
+        self.assertIn("eval suite", facts["fake-model-x/positive-a"]["integrity_violations"][0])
+        self.assertEqual(facts["fake-model-x/held-out-b"]["status"], "invalid", "hidden expectations in the trace")
+        self.assertEqual(run.main(["packet", str(self.run_dir)]), 0)
+        self.assertEqual(json.loads((self.run_dir / "judge-packet.json").read_text(encoding="utf-8")), [])
+
+    def test_listing_paths_in_output_is_not_a_violation(self) -> None:
+        listing = ("import json; print(json.dumps({'type':'item.completed','item':{'type':'command_execution',"
+                   "'command':'ls -R skills','aggregated_output':'skills/sample-skill/evals/evals.json'}}))")
+        facts = self.run_fake(listing)
+        self.assertEqual(facts["fake-model-x/positive-a"]["status"], "ok")
+
+    def test_sandbox_failures_are_environment_errors_and_report_says_rerun(self) -> None:
+        broken = ("import json; print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':'dir',"
+                  "'aggregated_output':'Failed to create unified exec process: CreateProcessAsUserW failed: 5'}}))")
+        facts = self.run_fake(broken)
+        self.assertTrue(all(f["status"] == "environment-error" for f in facts.values()))
+        judgement = self.root / "j.json"
+        judgement.write_text("[]", encoding="utf-8")
+        self.assertEqual(run.main(["collect", str(self.run_dir), "--judgement", str(judgement), "--judge", "j", "--judge-model", "m9", "--no-record"]), 0)
+        self.assertIn("fake-model-x/positive-a (environment-error)", (self.run_dir / "report.md").read_text(encoding="utf-8"))
+
+    def test_an_occasional_sandbox_failure_still_counts_as_a_run(self) -> None:
+        mixed = ("import json\n"
+                 "for out in ('CreateProcessAsUserW failed: 5', 'ok', 'ok'):\n"
+                 "    print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':'dir','aggregated_output':out}}))")
+        facts = self.run_fake(mixed)
+        fact = facts["fake-model-x/positive-a"]
+        self.assertEqual(fact["status"], "ok")
+        self.assertEqual(fact["sandbox_failures"], {"commands": 3, "failed": 1})
+
+    def test_cli_executors_are_cut_off_from_connectors_unless_a_case_opts_in(self) -> None:
+        claude = run.build_argv("claude", False, False, model="m", workspace="w", answer="a", prompt_line="p")
+        self.assertIn("--strict-mcp-config", claude)
+        self.assertIn("Read(~/.codex/skills/**)", claude)
+        self.assertFalse(any("config.toml" in a or "local" in a for a in claude), "no read grant beyond skills and rules")
+        codex = run.build_argv("codex", False, False, model="m", workspace="w", answer="a", prompt_line="p")
+        self.assertEqual(codex[-1], "-", "stdin marker stays last")
+        self.assertIn("apps", codex[codex.index("--disable") + 1])
+        judge = run.build_argv("codex", True, False, model="m", workspace="w", answer="a", prompt_line="p")
+        self.assertIn("read-only", judge)
+        self.assertIn("--disable", judge)
+        opted = run.build_argv("claude", False, True, model="m", workspace="w", answer="a", prompt_line="p")
+        self.assertNotIn("--strict-mcp-config", opted)
 
 
 class ResultsWriterTests(unittest.TestCase):

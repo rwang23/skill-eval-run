@@ -11,10 +11,19 @@ An eval run is evidence only when someone other than the executor could reproduc
 
 ## During the run
 
-- **Isolated.** One workspace per executor and case, each with its own copy of the fixture. No executor sees another's output.
+- **Isolated.** One randomly named workspace per executor and case, created in the system temp directory (or `prepare --workspace-root`), never inside the run directory or the Skill. Its parent folders reveal nothing about the run, and `prepare` refuses a root whose parents hold an `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md` that executors would load.
 - **Blind.** The prompt is the user request plus one line saying where the files are. Do not say it is an eval, name the case, or name the Skill unless the request itself would.
 - **Scoped.** CLI adapters run with a workspace-write sandbox rooted at the case workspace. Host subagents get the same prompt and nothing else.
+- **No credentials.** Executors and the judge get an allowlisted environment (system paths, home and temp folders, locale, agent config homes). Every other variable is withheld, because an agent can print its environment and the trace keeps what it prints. Add one with `plan --pass-env NAME` only when an adapter needs it to authenticate.
+- **No live accounts.** CLI adapters run without MCP servers or account connectors: Claude with `--strict-mcp-config` and an empty config, Codex with `--disable apps` and every configured MCP server disabled. A case that genuinely needs one sets `"mcp": true`. opencode and Gemini have no such switch; `execute` warns when they run.
+- **Rules readable.** Claude executors may read `~/.codex/skills`, `references`, `docs`, `AGENTS.md`, and `~/.claude/skills` and nothing else outside the workspace, so they can follow the same rules Codex reads.
 - **Traced.** Keep the full transcript. Routing is read from the trace, not from the answer's description of itself.
+
+## After the run: integrity
+
+`facts` marks a run **invalid** when the trace shows it saw eval controls: text from `expected_output` or `expectations` it was never shown, the run directory, another run's workspace, or a tool call that opened the target's `evals/` or this eval runner. Paths that merely appear in a directory listing do not count. Invalid runs are not judged or recorded; rerun them from a fresh `prepare`.
+
+A run where at least half of the commands were refused by the executor's sandbox (for example `CreateProcessAsUserW failed` on Windows) is an **environment-error**: also not judged; rerun it with `execute --case`. Fewer refusals are passed to the judge as `sandbox_failures`, and a step the sandbox blocked is not held against the Skill.
 
 ## Grading
 

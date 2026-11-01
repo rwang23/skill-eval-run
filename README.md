@@ -9,9 +9,10 @@ A Skill can score perfectly as a package and still fail when an agent actually u
 ## What it does
 
 - **Plans** a run over chosen cases and executors and reports the run count before anything starts.
-- **Prepares** one isolated workspace per executor and case, copying the case's fixture, with a prompt that does not reveal it is an eval.
+- **Prepares** one isolated workspace per executor and case, outside the run directory, copying the case's fixture, with a prompt that does not reveal it is an eval.
+- **Isolates** executors from your credentials and live accounts: an allowlisted environment, no MCP servers or account connectors, and read-only access to your Skills and rules only.
 - **Executes** headless on Codex (`codex exec`), Claude Code (`claude -p`), opencode (DeepSeek and other providers), or Gemini CLI, or registers runs the calling agent executed as subagents.
-- **Extracts** routing facts (Skills read or invoked, scripts run) and workspace changes from each trace.
+- **Extracts** routing facts (Skills read or invoked, scripts run) and workspace changes from each trace, and sets aside runs that saw eval controls or were blocked by their sandbox so they are rerun rather than graded.
 - **Judges** with a model that executed no case, grading routing, compliance, and expectations separately.
 - **Records** one run per executor in the Skill's `evals/results.json`, archives older revisions to `evals/history.jsonl`, and writes a per-case report.
 
