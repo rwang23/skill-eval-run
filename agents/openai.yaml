@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Eval Run"
+  short_description: "Blind multi-agent eval runs with an independent judge"
+  default_prompt: "Use $skill-eval-run to run this Skill's eval cases blind on at least two agents, grade them with an independent judge, and record the outcomes."
